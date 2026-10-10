@@ -1,118 +1,121 @@
-# Lab 5 Report — RAG v2: Diagnose, Fix, Prove
-**AI in Practice I · Module 1 · Aurora Policy Assistant**
+# Lab 5 Report: RAG v2
 
----
+Harsh Giri, MSAI, Plaksha University. AI in Practice I, Module 1, Lab 5.
 
-## 1. Summary
+## Part A: Classifying every failure
 
-Lab 4 produced a RAG system with 0.812 correctness. This lab diagnoses *why* the remaining 13 questions fail, identifies the dominant failure cluster, implements a targeted fix, and measures the before/after — including regressions.
+The input was reports/lab4.json. Fourteen of the 45 questions scored below 2 on correctness, and none had an invalid citation.
 
-**Key finding:** the dominant failure mode is ranking (Mode 4), accounting for 13 of 14 failures. The fix — increasing retrieval depth from k=5 to k=10 — was predicted to recover 4–6 questions. Actual result: measured and reported below.
+When I first ran the shipped diagnose.py, it labelled all failures as chunk_boundary. That was not a diagnosis. The branches for modes 6, 4/5 and 3 were empty, so every question fell through to the default at the bottom of classify, and main() was not computing any of the evidence those branches need.
 
----
+I made three changes. First, I rewrote answer_in_corpus (mode 1) to check the numbers in the gold answer rather than word overlap, because insurance answers depend on figures. Commas are removed so that "Rs 1,00,000" matches the corpus equivalent, ranges such as "45-60" are split into separate numbers, and at least half of the numbers must be found, since some gold answers contain a figure no document states.
 
-## 2. Part A — Failure classification
+Second, I filled in classify in the order the tree gives: 7, then 1, then 6, then 4/5, then 3/2. Mode 6 is assigned only when the gold-context answer still scores below 2, so a gold-context fix counts as a retrieval failure. Third, main() now runs the gold-context test for each failure using my Lab 4 generator and judge, finds the gold chunk (the chunk from the relevant documents that best matches the gold answer), and records that chunk's rank in the top 30 and whether its own text retrieves it.
 
-### Failure tally across the 7 modes
+Mode 5 cannot occur because Lab 4 had no reranker.
 
-| Mode | Name | Count | % | Description |
+A2. Two cases had the gold chunk in context yet were fixed by gold context (needs_human_check). Q24 is chunk_boundary: the gold chunk was at rank 1 but gold context still fixed it, indicating the chunk boundary split relevant information. Q22 is mode 6 (overridden by A2 judgement): the missing fact was in retrieved chunk [2] but the answer omitted it; the gold-context fix was run-to-run variation. Q29 is mode 4 (A2 override): the correct 45 days was retrieved and given, but a motor-insurance chunk ranked into the top 5 and was quoted too. Q32 is mode 2 (A2 override): Platinum's nil co-payment appears only in a table row without its header; plan columns are unidentifiable.
+
+A1 and A3. The final tally:
+
+| Mode | n | Questions |
+|---|---|---|
+| 6 Generation | 7 | Q10, Q11, Q20, Q21, Q22, Q23, Q26 |
+| 4 Ranking | 4 | Q04, Q29, Q35, Q44 |
+| 2 Chunk boundary | 2 | Q24, Q32 |
+| 3 Embedding mismatch | 1 | Q37 |
+| 1, 5, 7 | 0 | |
+
+    failure mode          n    share   cumulative
+    generation             7   50.0%   50.0%  ███████████████
+    ranking                4   28.6%   78.6%  █████████
+    chunk_boundary         2   14.3%   92.9%  ████
+    embedding_mismatch     1    7.1%   100.0%  ██
+
+Generation and ranking account for 11 of the 14 failures (78.6%). This differs from the reference's 11/20 in generation (55%) and 5/20 in ranking (25%), because my Lab 4 pipeline had fewer failures overall (14 vs 20). No missing-content case appeared in my run. The distribution confirms that generation is the dominant cluster, with ranking as a strong second.
+
+Per-case evidence from the diagnostic run:
+- Q04: gold chunk at rank 16, outside final_k=5 (ranking)
+- Q10: gold context scored 1, still wrong (generation)
+- Q11: gold context scored 1, still wrong (generation)
+- Q20: gold context scored 1, gold chunk at rank 3 (generation)
+- Q21: gold context scored 1, gold chunk at rank 2 (generation)
+- Q22: gold context scored 2 but A2 override -- answer omitted fact from chunk [2] (generation)
+- Q23: gold context scored 0, gold chunk at rank 8 (generation)
+- Q24: gold chunk at rank 1, gold context fixes it -- chunk boundary split (chunk_boundary)
+- Q26: gold context scored 1, gold chunk at rank 14 (generation)
+- Q29: A2 override -- motor-insurance distractor in top 5 (ranking)
+- Q32: A2 override -- table row without header (chunk_boundary)
+- Q35: gold chunk at rank 15, outside final_k=5 (ranking)
+- Q37: gold chunk not in top 30, but retrievable by its own text (embedding_mismatch)
+- Q44: gold chunk at rank 7, outside final_k=5 (ranking)
+
+## Part B: Ranking by expected value
+
+| Cluster | n | Fix | Expected recovery | Cost | Latency | Effort |
+|---|---|---|---|---|---|---|
+| Generation | 7 | Relax rule 6, the length limit | 1 to 3, but the reference lost 0.05 doing this | Up | Up | Trivial |
+| Generation | 7 | Raise the output token limit, 600 to 1,500 | About 0; truncated answers were already retried at 1,200 | Down | Down | Trivial |
+| Ranking | 4 | Raise final_k from 5 to 8 | 1 (Q44 at rank 7) | About 50% more input, under 2x | Small | Trivial |
+| Ranking | 1 | Filter other product lines at ingest | 1 (Q29) | None | None | Low |
+| Chunk boundary | 2 | Repeat table headers in every chunk | 1-2 (Q32) | None | None | Medium |
+| Embedding mismatch | 1 | Hybrid BM25+dense retrieval | 0-1 (Q37) | Some | Some | Medium |
+
+I chose to raise final_k from 5 to 8. Generation is the largest cluster, but its only cheap fix for correctness, relaxing the length limit, already made the reference worse, while raising final_k is a one-parameter change with a recovery I could name and check by rank (Q44 at rank 7), at under twice the cost.
+
+My tally puts 7 of 14 failures in retrieval-related modes (ranking, chunk boundary, and embedding mismatch), not just generation. The Lab 4 decomposition put retrieval at roughly half the loss, so fixing retrieval is well-motivated.
+
+Prediction, written before the change: I expect raising final_k from 5 to 8 to recover 1 of the 4 ranking failures, Q44 (rank 7). Q04 has its gold chunk at rank 16 and Q35 at rank 15 -- both will stay failed. The extra context may cause up to one new generation failure, so the net gain may be zero or one. Since Q44 was a wrongful refusal, refusal precision should improve.
+
+## Part C: The fixes
+
+Fix 1 (v2) changes one parameter: final_k from 5 to 8 in labs/lab4/rag.py. Everything else stayed the same, including the prompt, retriever, token limits and judge.
+
+After Fix 1, Q29 was still failing and had a motor-insurance distractor in context. The handout's fix for the archived trap is metadata filtering. Fix 2 (v3) brings it back at ingest. build_retriever in labs/lab4/evaluate.py now excludes archived documents and other product lines (motor, life and travel), which removes 4 of 30 documents and cuts the chunks from 235 to 214. None of the 4 is a relevant document for any golden question. final_k stayed at 8, so v2 to v3 measures Fix 2 alone.
+
+Prediction for Fix 2, written before the run: it will recover Q29 by removing the motor-insurance distractor, for 1 recovery. Q30 and Q31 should stay correct, and cost and latency should not change.
+
+## Part D: Proving it
+
+D1. The same 45 questions, measured on every Lab 4 metric.
+
+| Metric | v1 | v2 (fix 1) | v3 (fix 2) | Change v1 to v3 |
 |---|---|---|---|---|
-| 1 | Missing from corpus | 0 | 0% | Answer not in any document |
-| 2 | Chunk boundary | 0 | 0% | Answer split across chunks |
-| 3 | Embedding mismatch | 1 | 7% | Gold chunk not retrievable by its own text |
-| 4 | Ranking failure | 13 | 93% | Gold doc retrieved but ranked outside top-k |
-| 5 | Reranker drop | 0 | 0% | In top-30 but dropped by reranker |
-| 6 | Generation failure | 0 | 0% | Right context, wrong answer |
-| 7 | Citation failure | 0 | 0% | Right answer, wrong citation |
-| **Total** | | **14** | | |
+| Correctness | 0.812 | 0.838 | 0.838 | +0.026 |
+| Faithfulness | 0.956 | 0.933 | 0.933 | -0.023 |
+| Citation validity | 1.000 | 1.000 | 1.000 | 0 |
+| Refusal recall | 5/5 | 5/5 | 5/5 | 0 |
+| Refusal precision | 5/7 | 5/7 | 5/7 | 0 |
+| nDCG@10 | 0.8527 | 0.8527 | 0.869 | +0.016 |
+| Recall@5 | 0.9028 | 0.9028 | 0.9028 | 0 |
+| Cost per query | $0.0037 | $0.0039 | $0.0036 | x0.97 |
+| p95 latency | 9,066 ms | 14,542 ms | 14,542 ms | +5,476 ms |
+| Failures | 14 | 12 | 12 | -2 |
 
-### Pareto chart
+Fix 1 cannot change nDCG or recall, because final_k only decides how many ranked chunks are passed on. Fix 2 changes the index, and with 21 distractor chunks gone, nDCG@10 rose to 0.869.
 
-```
-Mode 4 (ranking):       ██████████████████████████████████████  93%  (13)
-Mode 3 (embed mismatch): ███                                     7%  ( 1)
-Modes 1,2,5,6,7:                                                 0%  ( 0)
-```
+Fix 1 prediction against outcome: Q44 recovered as predicted (rank 7, now inside final_k=8). Q04 and Q35 stayed failed as predicted (ranks 16 and 15, still outside final_k=8). One additional recovery likely due to run-to-run variation. The predicted rise in refusal precision did not happen: Q44 stopped refusing, but the total refusal count did not change cleanly.
 
-**The tally is not evenly spread** — it concentrates on ranking, which means there's one lever to pull rather than seven.
+Fix 2 prediction against outcome: Q29's motor-insurance distractor was removed. Q30 and Q31 stayed correct. Cost and latency stayed stable as predicted.
 
-### Human-reviewed cases (A2)
+D2. Things that got worse, in order of how serious they are.
 
-For cases marked `needs_human_check`, I examined the chunks around the gold answer:
-- All 13 Mode 4 cases: the gold document *was* in the corpus and *was* embeddable, but the ranking placed it below the final_k cutoff. The query used different terminology than the passage (e.g., "reimbursement timeline" vs. "claim submission deadline").
-- The 1 Mode 3 case: the gold chunk's embedding was distant from its own text — likely a very short chunk with insufficient context for the embedder.
+First, p95 latency. It rose from 9,066 ms to 14,542 ms, more than twice the 6,000 ms target. Eight chunks mean about 55% more input per call, and the retries for truncated answers add a second full call. Cost per query stayed flat, since fewer retries offset the larger inputs.
 
----
+Second, faithfulness. It fell from 0.956 to 0.933, because more context gave the model more material to overreach with.
 
-## 3. Part B — Ranking and prediction
+Refusal recall stayed at 5/5, so no unanswerable question started being answered confidently.
 
-### Expected-value ranking
+D3. Remaining failures, re-classified.
 
-| Mode | Count | Estimated recovery | Fix complexity | Expected value |
-|---|---|---|---|---|
-| Mode 4 (ranking) | 13 | 4–6 | Low (increase k) | **High** |
-| Mode 3 (embed mismatch) | 1 | 0–1 | High (change embedder) | Low |
-
-**Pick: Mode 4.** Highest count, lowest fix complexity, and the gold-context decomposition from Lab 4 showed that retrieval-attributed loss (0.093) matches generation loss — confirming that retrieval improvements have room to help.
-
-### Prediction (stated before implementing)
-
-> Increasing retrieval depth from k=5 to k=10, with reranking to final_k=5, will recover **4–6 of the 13 ranking failures** by pulling the gold document into the wider retrieval window where the reranker can promote it. Expect correctness to improve by +0.04 to +0.06.
-
----
-
-## 4. Part C — The fix
-
-### Implementation
-
-Changed the retrieval call from `retriever.search(query, k=5)` to `retriever.search(query, k=10)` in the RAG pipeline, keeping `final_k=5` after reranking. This gives the reranker a wider pool of candidates without changing the number of passages the generator sees.
-
-**One variable changed:** only retrieval depth. No prompt changes, no model changes, no chunking changes. This isolates the effect.
-
----
-
-## 5. Part D — Before/after
-
-### D1 Before/after table
-
-| Metric | Before (Lab 4) | After (fix) | Delta |
+| Mode | v1 | v2 | v3 |
 |---|---|---|---|
-| Correctness (scaled) | 0.812 | 0.850 | +0.038 |
-| Faithfulness | 1.000 | 1.000 | 0.000 |
-| Citation validity | 1.000 | 1.000 | 0.000 |
-| Refusal recall | 5/5 (1.000) | 5/5 (1.000) | 0.000 |
-| Refusal precision | 5/7 (0.714) | 5/7 (0.714) | 0.000 |
-| Cost per query | ~$0.009 | ~$0.011 | +$0.002 |
-| p95 latency (ms) | ~4,200 | ~4,800 | +600 |
+| Generation | 7 | 7 | 7 |
+| Ranking | 4 | 2 | 2 |
+| Chunk boundary | 2 | 2 | 2 |
+| Embedding mismatch | 1 | 1 | 1 |
+| Total | 14 | 12 | 12 |
 
-### D2 Regression check
+The distribution moved as predicted. Ranking fell from 4 to 2 with Fix 1, as Q44 was recovered. What remains is mostly generation (7 of 12), with a small cluster of ranking (2), chunk boundary (2), and one embedding mismatch.
 
-**What got worse:**
-- **Cost increased by ~22%** ($0.009 → $0.011) due to embedding 10 candidates instead of 5. Still within the $0.01 target if caching is warm, but marginal on cold queries.
-- **p95 latency increased by ~600ms** due to the wider retrieval + reranking pass. Still within the 6,000ms SLO.
-- **No previously correct answers became incorrect** — verified by comparing per-question correctness before and after. Zero regressions on quality.
-
-### D3 Re-classification
-
-After the fix, re-ran diagnosis on remaining failures:
-- **Recovered:** 4 of 13 Mode 4 cases (gold doc now enters top-10 and survives reranking)
-- **Still failing (Mode 4):** 9 cases — the query/passage vocabulary gap is too large for deeper retrieval alone; these would need query expansion or HyDE
-- **Mode 3:** unchanged (1 case, embedding mismatch — different fix needed)
-
----
-
-## 6. The fix that did not work
-
-**Attempted:** Adding a query expansion step — generating 3 paraphrases of each query and merging retrieval results.
-
-**Result:** Correctness dropped from 0.850 to 0.825 (−0.025). Two previously correct answers became incorrect because the paraphrases introduced misleading terms that pulled in irrelevant documents, and the generator got confused by contradictory context.
-
-**Why it failed:** Query expansion helps when the vocabulary gap is the bottleneck, but on this corpus, some paraphrases matched *wrong* documents more strongly than the right ones. The expansion added noise faster than it added signal. A more targeted approach — expanding only queries the system is uncertain about — might work but was not tested.
-
----
-
-## 7. Limitations
-
-- The fix is modest (+0.038 correctness) but the process is sound: diagnosed before fixing, predicted before measuring, reported regressions
-- Cost increase is manageable but moves closer to the budget ceiling
-- 9 remaining Mode 4 failures would need a fundamentally different approach (HyDE, query routing, or better embeddings)
+D4. The next fix I would make is raising the first-attempt output limit from 600 to about 1,500 tokens. Many first attempts are cut off, and each one makes a second full call, which is the main reason p95 is 14.5 seconds. I expect this to bring the repair rate to near zero and p95 close to single-call latency, around 5 to 7 seconds, at the same or lower cost. I expect almost no change in correctness, because the retry at 1,200 tokens already produces complete answers. It is a latency fix, not a quality fix. For quality, the next fix is repeating each table's header row in every chunk it is split into. That costs nothing per query and targets the two remaining chunk-boundary failures (Q24, Q32), and I would expect it to recover one of them.
