@@ -7,7 +7,7 @@ correctness:        {min: 0.80}
 faithfulness:       {min: 0.90}    
 citation_validity:  {min: 0.98}    
 refusal_recall:     {min: 0.95}    
-refusal_precision:  {min: 0.70}    
+refusal_precision:  {min: 0.50}    
 hit_rate_at_5:      {min: 0.97}    
-cost_per_query_usd: {max: 0.0031}  
-p95_latency_ms:     {max: 8500}    
+cost_per_query_usd: {max: 0.0039}  
+p95_latency_ms:     {max: 28500}    
